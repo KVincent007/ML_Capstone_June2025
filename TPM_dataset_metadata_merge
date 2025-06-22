@@ -1,0 +1,99 @@
+import pandas as pd
+
+title_to_gsm = {}
+with open('/content/GSE113957_family.soft.txt') as f:
+    gsm = None
+    for line in f:
+        line = line.strip()
+        if line.startswith("^SAMPLE"):
+            gsm = line.split(" = ", 1)[1]
+        elif line.startswith("!Sample_title") and gsm:
+            title = line.split(" = ", 1)[1].strip()
+            title_to_gsm[title] = gsm
+            gsm = None
+
+tpm = pd.read_csv("/content/GSE113957_norm_counts_TPM_GRCh38.p13_NCBI.csv", index_col=0)
+
+# Replace sample titles with GSM IDs (using your title_to_gsm mapping)
+tpm.rename(columns=title_to_gsm, inplace=True)
+
+# Drop any columns that couldn't be mapped
+tpm = tpm.loc[:, tpm.columns.notna()]
+
+# Transpose: make samples rows, genes columns
+tpm = tpm.T
+tpm.index.name = 'sample_id'
+
+# --- 2. Parse metadata from SOFT file ---
+sample_ids = []
+ages = []
+sexes = []
+diseases = []
+
+with open('/content/GSE113957_family.soft.txt', 'r') as f:
+    current_id = None
+    current_age = None
+    current_sex = None
+    current_disease = None
+
+    for line in f:
+        line = line.strip()
+        if line.startswith("^SAMPLE"):
+            if current_id:
+                sample_ids.append(current_id)
+                ages.append(current_age)
+                sexes.append(current_sex)
+                diseases.append(current_disease)
+            current_id = line.split(" = ")[1]
+            current_age = None
+            current_sex = None
+            current_disease = None
+        elif line.startswith("!Sample_characteristics_ch1"):
+            lower_line = line.lower()
+            if "age" in lower_line:
+                current_age = line.split(":")[-1].strip()
+            elif "sex" in lower_line:
+                current_sex = line.split(":")[-1].strip()
+            elif "disease" in lower_line or "diagnosis" in lower_line:
+                current_disease = line.split(":")[-1].strip()
+
+    # Don't forget the last sample
+    if current_id:
+        sample_ids.append(current_id)
+        ages.append(current_age)
+        sexes.append(current_sex)
+        diseases.append(current_disease)
+
+# --- 3. Build metadata DataFrame ---
+meta_df = pd.DataFrame({
+    "sample_id": sample_ids,
+    "Age": ages,
+    "sex": sexes,
+    "disease": diseases
+})
+
+# Convert age to numeric (some missing values might turn into NaN)
+meta_df["Age"] = pd.to_numeric(meta_df["Age"], errors='coerce')
+# Convert 'sex' to string before applying .str accessor
+meta_df["sex"] = meta_df["sex"].astype(str).str.capitalize()
+meta_df["disease"] = meta_df["disease"].astype(str).str.upper()
+
+# Normalize label case
+tpm.index = tpm.index.str.strip().str.upper()
+meta_df['sample_id'] = meta_df['sample_id'].str.strip().str.upper()
+
+# --- 4. Merge metadata with TPM ---
+merged = tpm.merge(meta_df, left_index=True, right_on='sample_id')
+
+# --- 5. Remove samples where disease == "HGPS" ---
+filtered = merged[merged["disease"] != "HGPS"].set_index('sample_id')
+
+
+# ✅ Result: 'filtered' now contains merged TPM + metadata, excluding HGPS
+print("Merged and filtered shape:", filtered.shape)
+print(filtered[["Age", "sex", "disease"]].head())
+#print("TPM sample IDs:", set(tpm.index[:5]))
+#print("Metadata sample IDs:", set(meta_df['sample_id'].head()))
+
+# Save the cleaned merged dataset to CSV
+filtered.to_csv("/content/merged_TPM_with_metadata_filtered.csv")
