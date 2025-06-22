@@ -1,0 +1,146 @@
+# Optimized XGBoost
+!pip install xgboost umap-learn shap --quiet
+
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import ElasticNet, LinearRegression
+from sklearn.svm import SVR
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import RepeatedKFold, GridSearchCV
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.feature_selection import SelectKBest, f_regression
+from xgboost import XGBRegressor
+import umap
+import shap
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings("ignore")
+
+# --- 1. Load Data ---
+df = pd.read_csv('/content/merged_TPM_with_metadata_filtered (1).csv', index_col=0)
+X_full = df.drop(columns=['Age', 'sex', 'disease'])
+y = df['Age']
+y_cls = pd.cut(y, bins=[0,21,41,61,81,100],
+               labels=['0-20','21-40','41-60','61-80','81-100'],
+               include_lowest=True)
+
+# --- 2. Cross-Validation & Parameter Grids ---
+outer_cv = RepeatedKFold(n_splits=10, n_repeats=1, random_state=42)
+enet_grid = {'alpha':[0.01,0.1,1.0], 'l1_ratio':[0.0,0.5,1.0]}
+svr_grid  = {'kernel':['poly','rbf'], 'degree':[2,3], 'C':[1,10],
+             'epsilon':[0.05,0.1], 'gamma':['scale',0.0002]}
+
+# --- 3. Results Storage ---
+results = {'ElasticNet':[], 'SVR':[], 'Linear':[], 'XGB':[]}
+true_lda, pred_lda = [], []
+age_bin_mid = {'0-20':10,'21-40':30,'41-60':50,'61-80':70,'81-100':90}
+
+# --- 4. Outer CV Loop ---
+for train_idx, test_idx in outer_cv.split(X_full, y_cls):
+    X_train_raw = X_full.iloc[train_idx];  X_test_raw = X_full.iloc[test_idx]
+    y_train = y.iloc[train_idx];           y_test = y.iloc[test_idx]
+    y_cls_train = y_cls.iloc[train_idx]
+
+    # 4a. Supervised fold-specific filtering
+    max_vals = X_train_raw.max()
+    min_vals = X_train_raw.min().replace(0, np.nan)
+    mask = (max_vals > 5) & ((max_vals / min_vals) >= 5)
+    X_train = np.log2(X_train_raw.loc[:,mask] + 1)
+    X_test  = np.log2(X_test_raw.loc[:,mask]  + 1)
+
+    # 4b. Scale
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s  = scaler.transform(X_test)
+
+    # 4c. ElasticNet (nested CV)
+    enet_cv = GridSearchCV(
+        ElasticNet(max_iter=5000),
+        enet_grid,
+        cv=RepeatedKFold(n_splits=5, n_repeats=1, random_state=42),
+        scoring='neg_mean_absolute_error',
+        n_jobs=-1
+    )
+    enet_cv.fit(X_train_s, y_train)
+    p = enet_cv.predict(X_test_s)
+    results['ElasticNet'].append((mean_absolute_error(y_test,p), r2_score(y_test,p)))
+
+    # 4d. SVR (nested CV)
+    svr_cv = GridSearchCV(
+        SVR(),
+        svr_grid,
+        cv=RepeatedKFold(n_splits=5, n_repeats=1, random_state=42),
+        scoring='neg_mean_absolute_error',
+        n_jobs=-1
+    )
+    svr_cv.fit(X_train_s, y_train)
+    p = svr_cv.predict(X_test_s)
+    results['SVR'].append((mean_absolute_error(y_test,p), r2_score(y_test,p)))
+
+    # 4e. Linear Regression
+    lr = LinearRegression()
+    lr.fit(X_train_s, y_train)
+    p = lr.predict(X_test_s)
+    results['Linear'].append((mean_absolute_error(y_test,p), r2_score(y_test,p)))
+
+    # 4f. XGBoost
+    param_grid = {
+    'n_estimators': [100, 300, 500],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'max_depth': [3, 5, 7],
+    'subsample': [0.6, 0.8, 1.0],
+    'colsample_bytree': [0.6, 0.8, 1.0],
+    'reg_alpha': [0, 0.1, 1.0],
+    'reg_lambda': [1.0, 5.0, 10.0]
+    }
+
+    xgb = XGBRegressor(random_state=42, n_jobs=-1)
+    xgb_cv = GridSearchCV(
+    xgb,
+    param_grid,
+    cv=RepeatedKFold(n_splits=5, n_repeats=1, random_state=42),
+    scoring='neg_mean_absolute_error',
+    n_jobs=-1
+    )
+    xgb_cv.fit(X_train_s, y_train)
+    print("Best XGB params:", xgb_cv.best_params_)
+
+    # 4g. LDA classification
+    lda = LinearDiscriminantAnalysis(solver='eigen', shrinkage='auto')
+    lda.fit(X_train_s, y_cls_train)
+    cls_p = lda.predict(X_test_s)
+    true_lda.extend(y_test)
+    pred_lda.extend([age_bin_mid[str(c)] for c in cls_p])
+
+# --- 5. Summarize Regression Performance ---
+print("Regression Models Performance (mean over folds):")
+for name in ['ElasticNet','SVR','Linear','XGB']:
+    maes = [m[0] for m in results[name]]
+    r2s  = [m[1] for m in results[name]]
+    print(f"  {name}: MAE = {np.mean(maes):.2f}, R² = {np.mean(r2s):.2f}")
+
+# --- 6. Summarize LDA Performance ---
+print(f"LDA → MAE = {mean_absolute_error(true_lda,pred_lda):.2f}, R² = {r2_score(true_lda,pred_lda):.2f}")
+
+# --- 7. UMAP Visualization ---
+max_vals = X_full.max()
+min_vals = X_full.min().replace(0,np.nan)
+mask = (max_vals > 5) & ((max_vals / min_vals) >= 5)
+X_vis = np.log2(X_full.loc[:,mask] + 1)
+X_vis_s = StandardScaler().fit_transform(X_vis)
+embed = umap.UMAP(n_components=2, random_state=42).fit_transform(X_vis_s)
+
+plt.figure(figsize=(8,6))
+sns.scatterplot(x=embed[:,0], y=embed[:,1], hue=y, palette='plasma', alpha=0.7)
+plt.title("UMAP of Gene Expression Colored by Age")
+plt.show()
+
+# --- 8. SHAP Interpretation on XGBoost ---
+X_full_s = StandardScaler().fit_transform(np.log2(X_full.loc[:,mask] + 1))
+xgb_full = XGBRegressor(n_estimators=100, random_state=42, n_jobs=-1).fit(X_full_s, y)
+explainer = shap.Explainer(xgb_full)
+shap_vals = explainer(X_full_s)
+
+shap.summary_plot(shap_vals, features=X_vis, feature_names=list(X_vis.columns))
